@@ -31,7 +31,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -in file_path                        Default: bourne.mp4 in data subdirectory of workplace
     // -out file_path                       Default: out.dat in data subdirectory of workplace
 
-    // Set up default values of options
     let mut verbose = false;
     let mut report = true;
     let mut check_decode = false;
@@ -54,18 +53,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut output_file_path,
     );
 
-    // Run an FFmpeg command to decode video from inptu_file_path
-    // Get output as grayscale (i.e., just the Y plane)
-
-    let mut iter = FfmpegCommand::new() // <- Builder API like `std::process::Command`
+    let mut iter = FfmpegCommand::new()
         .input(input_file_path.to_str().unwrap())
         .format("rawvideo")
         .pix_fmt("gray8")
         .output("-")
-        .spawn()? // <- Ordinary `std::process::Child`
-        .iter()?; // <- Blocking iterator over logs and output
+        .spawn()?
+        .iter()?;
 
-    // Figure out geometry of frame.
+    
     let mut width = 0;
     let mut height = 0;
 
@@ -87,54 +83,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => (),
         }
     }
+
     assert!(width != 0);
     assert!(height != 0);
 
-    // Set up initial prior frame as uniform medium gray (y = 128)
-    let mut prior_frame = vec![128 as u8; (width * height) as usize];
+    let mut prior_frame = vec![128u8; (width * height) as usize];
 
     let output_file = match File::create(&output_file_path) {
         Err(_) => panic!("Error opening output file"),
         Ok(f) => f,
     };
 
-    // Setup bit writer and arithmetic encoder.
-
     let mut buf_writer = BufWriter::new(output_file);
     let mut bw = BitWriter::new(&mut buf_writer);
-
     let mut enc = Encoder::new();
 
-    // Set up arithmetic coding context(s)
-    let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
 
-    // Process frames
+    let mut pixel_difference_pdfs: Vec<VectorCountSymbolModel<i32>> = (0..16)
+        .map(|_| VectorCountSymbolModel::new((0..=255).collect()))
+        .collect();
+
+    // the encoding of the frames
     for frame in iter.filter_frames() {
         if frame.frame_num < skip_count {
             if verbose {
                 println!("Skipping frame {}", frame.frame_num);
             }
         } else if frame.frame_num < skip_count + count {
-            let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
+            let current_frame: Vec<u8> = frame.data;
 
             let bits_written_at_start = enc.bits_written();
 
-            // Process pixels in row major order.
             for r in 0..height {
                 for c in 0..width {
                     let pixel_index = (r * width + c) as usize;
 
-                    // Encode difference with same pixel in prior frame.
-                    // Normalize and modulate difference to 8-bit range.
-                    let pixel_difference = (((current_frame[pixel_index] as i32)
-                        - (prior_frame[pixel_index] as i32))
-                        + 256)
-                        % 256;
+                    let prior = prior_frame[pixel_index];
 
-                    enc.encode(&pixel_difference, &pixel_difference_pdf, &mut bw);
+                    let left = if c > 0 {
+                        current_frame[(r * width + (c - 1)) as usize]
+                    } else {
+                        prior
+                    };
 
-                    // Update context
-                    pixel_difference_pdf.incr_count(&pixel_difference);
+                    let up = if r > 0 {
+                        current_frame[((r - 1) * width + c) as usize]
+                    } else {
+                        prior
+                    };
+
+                    // predicting using the average of left pixel, upwards pixel, and prior pixel
+                    let prediction = ((left as u16 + up as u16 + prior as u16) / 3) as u8;
+
+                    // setting range as between 0..255
+                    let pixel_difference =
+                        (((current_frame[pixel_index] as i32) - (prediction as i32)) + 256) % 256;
+
+        
+                    let context = (left.abs_diff(up) / 16) as usize; // 0..15
+
+                    enc.encode(&pixel_difference, &pixel_difference_pdfs[context], &mut bw);
+                    pixel_difference_pdfs[context].incr_count(&pixel_difference);
                 }
             }
 
@@ -154,54 +163,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Tie off arithmetic encoder and flush to file.
+    // encoding
     enc.finish(&mut bw)?;
     bw.pad_to_byte()?;
     buf_writer.flush()?;
 
-    // Decompress and check for correctness.
+    // checking correctness and decoding
     if check_decode {
         let output_file = match File::open(&output_file_path) {
             Err(_) => panic!("Error opening output file"),
             Ok(f) => f,
         };
+
         let mut buf_reader = BufReader::new(output_file);
         let mut br: BitReader<_, MSB> = BitReader::new(&mut buf_reader);
 
-        let iter = FfmpegCommand::new() // <- Builder API like `std::process::Command`
+        let iter = FfmpegCommand::new()
             .input(input_file_path.to_str().unwrap())
             .format("rawvideo")
             .pix_fmt("gray8")
             .output("-")
-            .spawn()? // <- Ordinary `std::process::Child`
-            .iter()?; // <- Blocking iterator over logs and output
+            .spawn()?
+            .iter()?;
 
         let mut dec = Decoder::new();
 
-        let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+        let mut pixel_difference_pdfs: Vec<VectorCountSymbolModel<i32>> = (0..16)
+            .map(|_| VectorCountSymbolModel::new((0..=255).collect()))
+            .collect();
 
-        // Set up initial prior frame as uniform medium gray
-        let mut prior_frame = vec![128 as u8; (width * height) as usize];
+        let mut prior_frame = vec![128u8; (width * height) as usize];
 
-        'outer_loop: 
-        for frame in iter.filter_frames() {
+        'outer_loop: for frame in iter.filter_frames() {
             if frame.frame_num < skip_count + count {
                 if verbose {
                     print!("Checking frame: {} ... ", frame.frame_num);
                 }
 
-                let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
+                let current_frame: Vec<u8> = frame.data;
+                let mut reconstructed_frame = vec![0u8; (width * height) as usize];
 
-                // Process pixels in row major order.
                 for r in 0..height {
                     for c in 0..width {
                         let pixel_index = (r * width + c) as usize;
-                        let decoded_pixel_difference = dec.decode(&pixel_difference_pdf, &mut br).to_owned();
-                        pixel_difference_pdf.incr_count(&decoded_pixel_difference);
 
-                        let pixel_value = (prior_frame[pixel_index] as i32 + decoded_pixel_difference) % 256;
+                        let prior = prior_frame[pixel_index];
 
-                        if pixel_value != current_frame[pixel_index] as i32 {
+                        let left = if c > 0 {
+                            reconstructed_frame[(r * width + (c - 1)) as usize]
+                        } else {
+                            prior
+                        };
+
+                        let up = if r > 0 {
+                            reconstructed_frame[((r - 1) * width + c) as usize]
+                        } else {
+                            prior
+                        };
+
+                        let prediction = ((left as u16 + up as u16 + prior as u16) / 3) as u8;
+                        let context = (left.abs_diff(up) / 16) as usize;
+
+                        let decoded_pixel_difference =
+                            dec.decode(&pixel_difference_pdfs[context], &mut br).to_owned();
+
+                        pixel_difference_pdfs[context].incr_count(&decoded_pixel_difference);
+
+                        let pixel_value =
+                            ((prediction as i32 + decoded_pixel_difference) % 256) as u8;
+
+                        reconstructed_frame[pixel_index] = pixel_value;
+
+                        if pixel_value != current_frame[pixel_index] {
                             println!(
                                 " error at ({}, {}), should decode {}, got {}",
                                 c, r, current_frame[pixel_index], pixel_value
@@ -211,15 +244,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+
                 println!("correct.");
-                prior_frame = current_frame;
+                prior_frame = reconstructed_frame;
             } else {
                 break 'outer_loop;
             }
         }
     }
 
-    // Emit report
+    // Report
     if report {
         println!(
             "{} frames encoded, average size (bits): {}, compression ratio: {:.2}",
